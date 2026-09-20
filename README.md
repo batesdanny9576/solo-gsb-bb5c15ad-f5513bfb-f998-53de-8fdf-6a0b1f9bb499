@@ -1,6 +1,6 @@
 # 设备告警事件段聚合服务
 
-基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。
+基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。
 
 ## 快速开始
 
@@ -66,6 +66,53 @@ curl http://localhost:8000/segments/1
 curl 'http://localhost:8000/segments?source=edge-gateway-01'
 ```
 
+### 增量同步变更流 `GET /segment-changes?after=&limit=`
+
+下游系统可按 `change_id` 升序增量拉取事件段变更，实现增量同步：
+
+```bash
+curl 'http://localhost:8000/segment-changes?after=0&limit=100'
+```
+
+```json
+{
+  "changes": [
+    {
+      "change_id": 1,
+      "type": "upsert",
+      "segment_id": 1,
+      "merged_into": null,
+      "revision": 1,
+      "segment": {
+        "id": 1,
+        "source": "edge-gateway-01",
+        "started_at": "2026-09-20T08:00:00+00:00",
+        "ended_at": "2026-09-20T08:00:00+00:00",
+        "max_severity": "warning",
+        "event_count": 1,
+        "revision": 1
+      }
+    },
+    {
+      "change_id": 4,
+      "type": "merged",
+      "segment_id": 2,
+      "merged_into": 1,
+      "revision": null,
+      "segment": null
+    }
+  ],
+  "next_after": 4
+}
+```
+
+- **何时产生记录**：每次创建段、边界或最高级别变化（`revision` 递增）、多段合并，都会在事件写入的**同一事务**内追加变更记录；`change_id` 全局单调递增。
+- **`upsert`**：段的新状态，`segment` 为变更时刻的完整快照（含 `event_count`、`revision`）。
+- **`merged`**：合并墓碑，表示 `segment_id` 段已被删除并并入 `merged_into` 指向的保留段；每个被删除段各产生一条。
+- **何时不产生记录**：仅事件数增加（`revision` 不变）不写 `upsert`；重复提交 `(source, event_id)` 的幂等重放不写任何记录。
+- **分页约定**：用上一页返回的 `next_after` 作为下一页的 `after` 继续拉取；`change_id` 单调递增保证分页期间新写入的变更只会出现在后续页——不漏读、不重复。返回空页时 `next_after` 与入参 `after` 相同，可直接继续轮询。
+- `after` 默认 `0`（从头开始）；`limit` 默认 `100`，最大 `1000`。
+
 ### 健康检查 `GET /healthz`
 
 ## 归段与 revision 规则
@@ -73,6 +120,7 @@ curl 'http://localhost:8000/segments?source=edge-gateway-01'
 - 新事件的 `occurred_at` 落在某段 `[start - silence, end + silence]` 窗口内即并入该段；同时命中多个段（迟到事件桥接）时自动合并为一段，事件数累加。
 - 段的 `revision` 初始为 1；**仅当**新事件导致段的起止边界或最高级别发生变化时递增，仅事件数增加不递增。
 - `(source, event_id)` 唯一约束保证幂等：重复提交直接返回原段，不改计数、不改 revision。
+- 上述每次段创建、边界/最高级别变化与合并都会写入变更流（见 `GET /segment-changes`），供下游增量同步；历史段（变更流上线前已存在）不补录，订阅从部署后的新变更开始。
 
 ## 本地开发与测试
 

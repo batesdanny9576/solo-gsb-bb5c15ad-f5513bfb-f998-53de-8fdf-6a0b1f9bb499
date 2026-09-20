@@ -40,6 +40,10 @@ class ServiceTestCase(unittest.TestCase):
         with session(self.db_path) as conn:
             return service.get_segment(conn, segment_id)
 
+    def changes(self, after=0, limit=100):
+        with session(self.db_path) as conn:
+            return service.list_segment_changes(conn, after=after, limit=limit)
+
     def test_first_event_creates_segment(self):
         r = self.submit("s1", "e1", 1000.0, "warning")
         self.assertFalse(r["deduplicated"])
@@ -135,6 +139,103 @@ class ServiceTestCase(unittest.TestCase):
         self.submit("s1", "e3", 21.0, "info")      # 21 > 1+10 → 段 B rev=1
         r = self.submit("s1", "e4", 11.0)          # 桥接 A、B
         self.assertGreaterEqual(r["segment"]["revision"], 3)
+
+    # ---- 变更流（segment_changes）----
+
+    def test_create_emits_upsert_change(self):
+        r = self.submit("s1", "e1", 1000.0, "warning")
+        page = self.changes()
+        self.assertEqual(len(page["changes"]), 1)
+        ch = page["changes"][0]
+        self.assertEqual(ch["change_id"], 1)
+        self.assertEqual(ch["type"], "upsert")
+        self.assertEqual(ch["segment_id"], r["segment"]["id"])
+        self.assertEqual(ch["revision"], 1)
+        self.assertIsNone(ch["merged_into"])
+        self.assertEqual(ch["segment"], r["segment"])  # 快照与段状态一致
+        self.assertEqual(page["next_after"], 1)
+
+    def test_boundary_or_severity_change_emits_upsert(self):
+        self.submit("s1", "e1", 1000.0, "info")
+        self.submit("s1", "e2", 1005.0, "error")   # 扩 end + 提级 → rev 2
+        page = self.changes()
+        self.assertEqual([c["type"] for c in page["changes"]], ["upsert", "upsert"])
+        second = page["changes"][1]
+        self.assertEqual(second["revision"], 2)
+        self.assertEqual(second["segment"]["max_severity"], "error")
+        self.assertEqual(second["segment"]["event_count"], 2)
+        ids = [c["change_id"] for c in page["changes"]]
+        self.assertLess(ids[0], ids[1])            # 单调递增
+
+    def test_count_only_increase_emits_no_change(self):
+        self.submit("s1", "e1", 1000.0, "error")
+        self.submit("s1", "e2", 1010.0)            # 扩边界 → upsert
+        before = self.changes()["changes"]
+        self.assertEqual(len(before), 2)
+        self.submit("s1", "e3", 1005.0, "debug")   # 仅事件数 +1，revision 不变
+        self.assertEqual(self.changes()["changes"], before)  # 无新增变更
+
+    def test_duplicate_event_id_emits_no_change(self):
+        self.submit("s1", "e1", 1000.0)
+        before = self.changes()["changes"]
+        r = self.submit("s1", "e1", 1000.0)        # 幂等重放
+        self.assertTrue(r["deduplicated"])
+        self.assertEqual(self.changes()["changes"], before)
+
+    def test_merge_emits_tombstone_per_deleted_segment(self):
+        r1 = self.submit("s1", "e1", 0.0)          # 段 A
+        r2 = self.submit("s1", "e2", 11.0)         # 段 B
+        r3 = self.submit("s1", "e3", 22.0)         # 段 C
+        self.submit("s1", "e4", 5.0)               # 合并 A+B
+        self.submit("s1", "e5", 16.0)              # 桥接 [A+B] 与 C → 三段合并
+        page = self.changes()
+        types = [c["type"] for c in page["changes"]]
+        # 3 次创建 + (B 墓碑 + A upsert) + (C 墓碑 + A upsert)
+        self.assertEqual(
+            types,
+            ["upsert", "upsert", "upsert", "merged", "upsert", "merged", "upsert"],
+        )
+        tombs = [c for c in page["changes"] if c["type"] == "merged"]
+        self.assertEqual(
+            {t["segment_id"] for t in tombs},
+            {r2["segment"]["id"], r3["segment"]["id"]},
+        )
+        for t in tombs:                            # 每个墓碑都指向保留段 A
+            self.assertEqual(t["merged_into"], r1["segment"]["id"])
+            self.assertIsNone(t["segment"])
+        final = page["changes"][-1]
+        self.assertEqual(final["type"], "upsert")
+        self.assertEqual(final["segment_id"], r1["segment"]["id"])
+        self.assertEqual(final["segment"]["event_count"], 5)
+        ids = [c["change_id"] for c in page["changes"]]
+        self.assertEqual(ids, sorted(ids))         # 全局单调递增
+        self.assertEqual(len(set(ids)), len(ids))
+
+    def test_pagination_no_miss_no_dup_while_ingesting(self):
+        for i in range(5):                         # 5 个独立段 → 5 条 upsert
+            self.submit("s1", f"e{i}", 1000.0 + i * 100.0)
+
+        page1 = self.changes(after=0, limit=2)
+        self.assertEqual([c["change_id"] for c in page1["changes"]], [1, 2])
+        self.assertEqual(page1["next_after"], 2)
+
+        self.submit("s1", "e5", 2000.0)            # 分页期间又有新事件
+
+        page2 = self.changes(after=page1["next_after"], limit=2)
+        page3 = self.changes(after=page2["next_after"], limit=100)
+        seen = [c["change_id"] for p in (page1, page2, page3) for c in p["changes"]]
+        self.assertEqual(seen, [1, 2, 3, 4, 5, 6])  # 不漏读
+        self.assertEqual(len(seen), len(set(seen)))  # 不重复
+
+        empty = self.changes(after=page3["next_after"])  # 已读完：空页
+        self.assertEqual(empty["changes"], [])
+        self.assertEqual(empty["next_after"], page3["next_after"])  # 游标不动
+
+    def test_empty_changes_next_after_echoes_after(self):
+        page = self.changes(after=0)
+        self.assertEqual(page, {"changes": [], "next_after": 0})
+        page = self.changes(after=42)
+        self.assertEqual(page, {"changes": [], "next_after": 42})
 
 
 if __name__ == "__main__":

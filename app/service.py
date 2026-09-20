@@ -8,6 +8,12 @@
 - (source, event_id) 唯一，重复提交直接返回原段，不改变任何计数；
 - revision 初始为 1，仅当新事件导致段的起止边界或最高级别发生变化时递增，
   仅事件数增加不递增。
+
+变更流（供下游增量同步）：
+- 每次创建段、边界或最高级别变化（revision 递增）、多段合并，都在事件写入
+  事务内向 segment_changes 追加记录，change_id 单调递增；
+- 合并时为每个被删除段写一条指向保留段的 merged 墓碑；
+- 仅事件数增加（revision 不变）不写 upsert；event_id 幂等重放不写任何记录。
 """
 from __future__ import annotations
 
@@ -49,6 +55,80 @@ def list_segments(conn: sqlite3.Connection, source: str | None = None) -> list[d
             "SELECT * FROM segments WHERE source = ? ORDER BY id", (source,)
         ).fetchall()
     return [_row_to_segment(r) for r in rows]
+
+
+def _record_change(
+    conn: sqlite3.Connection,
+    *,
+    change_type: str,
+    segment_id: int,
+    now: float,
+    merged_into: int | None = None,
+    revision: int | None = None,
+    source: str | None = None,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    max_severity: str | None = None,
+    event_count: int | None = None,
+) -> None:
+    """在事件写入事务内追加一条变更记录（change_id 由 AUTOINCREMENT 保证单调递增）。"""
+    conn.execute(
+        """
+        INSERT INTO segment_changes
+            (type, segment_id, merged_into, revision, source,
+             start_ts, end_ts, max_severity, event_count, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            change_type, segment_id, merged_into, revision, source,
+            start_ts, end_ts, max_severity, event_count, now,
+        ),
+    )
+
+
+def _row_to_change(row: sqlite3.Row) -> dict:
+    change = {
+        "change_id": row["change_id"],
+        "type": row["type"],
+        "segment_id": row["segment_id"],
+        "merged_into": row["merged_into"],
+        "revision": row["revision"],
+        "segment": None,
+    }
+    if row["type"] == "upsert":
+        change["segment"] = {
+            "id": row["segment_id"],
+            "source": row["source"],
+            "started_at": _iso(row["start_ts"]),
+            "ended_at": _iso(row["end_ts"]),
+            "max_severity": row["max_severity"],
+            "event_count": row["event_count"],
+            "revision": row["revision"],
+        }
+    return change
+
+
+def list_segment_changes(
+    conn: sqlite3.Connection, *, after: int = 0, limit: int = 100
+) -> dict:
+    """按 change_id 升序返回变更流的一页：{"changes": [...], "next_after": int}。
+
+    键集分页（change_id > after）：change_id 单调递增，分页期间新写入的变更
+    只会获得更大的 change_id、出现在后续页，因此不漏读也不重复。
+    next_after 可直接作为下一页的 after；空页时与入参 after 相同，便于轮询。
+    """
+    rows = conn.execute(
+        """
+        SELECT * FROM segment_changes
+        WHERE change_id > ?
+        ORDER BY change_id
+        LIMIT ?
+        """,
+        (after, limit),
+    ).fetchall()
+    changes = [_row_to_change(r) for r in rows]
+    next_after = changes[-1]["change_id"] if changes else after
+    return {"changes": changes, "next_after": next_after}
 
 
 def _find_merge_candidates(
@@ -114,6 +194,18 @@ def ingest_event(
             (source, occurred_ts, occurred_ts, severity, now, now),
         )
         segment_id = cur.lastrowid
+        _record_change(
+            conn,
+            change_type="upsert",
+            segment_id=segment_id,
+            now=now,
+            revision=1,
+            source=source,
+            start_ts=occurred_ts,
+            end_ts=occurred_ts,
+            max_severity=severity,
+            event_count=1,
+        )
     else:
         survivor = candidates[0]  # id 最小者作为保留段
         segment_id = survivor["id"]
@@ -138,6 +230,15 @@ def ingest_event(
                 [segment_id, *others],
             )
             conn.execute(f"DELETE FROM segments WHERE id IN ({marks})", others)
+            # 每个被删除段一条 merged 墓碑，指向保留段
+            for deleted_id in others:
+                _record_change(
+                    conn,
+                    change_type="merged",
+                    segment_id=deleted_id,
+                    merged_into=segment_id,
+                    now=now,
+                )
 
         conn.execute(
             """
@@ -148,6 +249,21 @@ def ingest_event(
             """,
             (start_ts, end_ts, max_severity, event_count, revision, now, segment_id),
         )
+        if changed:
+            # 边界或最高级别变化（revision 递增）才写 upsert；
+            # 仅事件数增加时不产生变更记录
+            _record_change(
+                conn,
+                change_type="upsert",
+                segment_id=segment_id,
+                now=now,
+                revision=revision,
+                source=source,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                max_severity=max_severity,
+                event_count=event_count,
+            )
 
     conn.execute(
         """
