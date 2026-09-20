@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -42,3 +43,20 @@ class SegmentOut(BaseModel):
 class IngestResponse(BaseModel):
     deduplicated: bool
     segment: SegmentOut
+
+
+class SegmentChangeOut(BaseModel):
+    """变更流记录：upsert 携带段快照；merged 为被删段墓碑，指向保留段。"""
+
+    change_id: int
+    change_type: Literal["upsert", "merged"]
+    segment_id: int
+    revision: int
+    merged_into: int | None = None
+    segment: SegmentOut | None = None
+
+
+class SegmentChangesOut(BaseModel):
+    changes: list[SegmentChangeOut]
+    # 下一页游标：作为 after 参数继续拉取；无新记录时与入参 after 相同
+    next_after: int

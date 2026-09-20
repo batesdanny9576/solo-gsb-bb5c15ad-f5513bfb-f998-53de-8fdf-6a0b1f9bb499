@@ -102,5 +102,67 @@ def test_get_missing_segment_404(client):
     assert client.get("/segments/9999").status_code == 404
 
 
+def _post(client, source, event_id, occurred_at, severity="info"):
+    return client.post("/events", json={
+        "source": source, "event_id": event_id,
+        "occurred_at": occurred_at, "severity": severity,
+    })
+
+
+def test_segment_changes_upsert_only_on_visible_change(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "warning")  # 扩展 end
+    # 幂等重放与段内低级别事件（仅计数增加）均不产生变更
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")
+    _post(client, "gw-01", "e3", "2026-09-20T08:00:15Z", "debug")
+
+    resp = client.get("/segment-changes")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [c["change_id"] for c in body["changes"]] == [1, 2]
+    assert all(c["change_type"] == "upsert" for c in body["changes"])
+    assert body["changes"][0]["segment"]["revision"] == 1
+    assert body["changes"][1]["segment"]["revision"] == 2
+    assert body["changes"][1]["segment"]["event_count"] == 2
+    assert body["next_after"] == 2
+
+    # 逐页拉取与全量一致；空页回显 after
+    ids, after = [], 0
+    while True:
+        page = client.get("/segment-changes",
+                          params={"after": after, "limit": 1}).json()
+        ids.extend(c["change_id"] for c in page["changes"])
+        after = page["next_after"]
+        if not page["changes"]:
+            break
+    assert ids == [1, 2]
+    assert after == 2
+
+
+def test_segment_changes_merge_tombstone(client):
+    a = _post(client, "gw-02", "e1", "2026-09-20T08:00:00Z").json()
+    b = _post(client, "gw-02", "e2", "2026-09-20T08:02:00Z").json()  # 超静默间隔 → 新段
+    _post(client, "gw-02", "e3", "2026-09-20T08:01:00Z")             # 桥接两段
+
+    changes = client.get("/segment-changes").json()["changes"]
+    assert [c["change_type"] for c in changes] == [
+        "upsert", "upsert", "merged", "upsert",
+    ]
+    tomb = changes[2]
+    assert tomb["segment_id"] == b["segment"]["id"]
+    assert tomb["merged_into"] == a["segment"]["id"]
+    assert tomb["segment"] is None
+    final = changes[3]
+    assert final["segment_id"] == a["segment"]["id"]
+    assert final["segment"]["event_count"] == 3
+    assert final["segment"]["revision"] == 2
+
+
+def test_segment_changes_params_validated(client):
+    assert client.get("/segment-changes", params={"limit": 0}).status_code == 422
+    assert client.get("/segment-changes", params={"limit": 1001}).status_code == 422
+    assert client.get("/segment-changes", params={"after": -1}).status_code == 422
+
+
 def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}

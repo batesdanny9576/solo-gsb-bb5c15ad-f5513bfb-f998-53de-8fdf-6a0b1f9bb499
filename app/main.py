@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from .config import Settings
 from .db import init_db, session
-from .schemas import EventIn, IngestResponse, SegmentOut
+from .schemas import EventIn, IngestResponse, SegmentChangesOut, SegmentOut
 from . import service
 
 # SQLite 单写者：进程内串行化归段写入，配合事务保证合并一致性
@@ -59,6 +59,19 @@ def create_app(settings: Settings) -> FastAPI:
         """列出事件段，可按 source 过滤。"""
         with session(settings.database_path) as conn:
             return service.list_segments(conn, source)
+
+    @app.get("/segment-changes", response_model=SegmentChangesOut)
+    def list_segment_changes(
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict:
+        """段变更流：按 change_id 升序返回 after 之后的 upsert/merged 记录。
+
+        用响应中的 next_after 作为下一页的 after；变更流只增不改，
+        翻页期间的新写入不会导致漏读或重复。
+        """
+        with session(settings.database_path) as conn:
+            return service.list_segment_changes(conn, after=after, limit=limit)
 
     return app
 

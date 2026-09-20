@@ -66,6 +66,49 @@ curl http://localhost:8000/segments/1
 curl 'http://localhost:8000/segments?source=edge-gateway-01'
 ```
 
+### 段变更流 `GET /segment-changes`（下游增量同步）
+
+```bash
+curl 'http://localhost:8000/segment-changes?after=0&limit=100'
+```
+
+```json
+{
+  "changes": [
+    {
+      "change_id": 1,
+      "change_type": "upsert",
+      "segment_id": 1,
+      "revision": 1,
+      "merged_into": null,
+      "segment": {
+        "id": 1,
+        "source": "edge-gateway-01",
+        "started_at": "2026-09-20T08:00:00+00:00",
+        "ended_at": "2026-09-20T08:00:00+00:00",
+        "max_severity": "warning",
+        "event_count": 1,
+        "revision": 1
+      }
+    },
+    {
+      "change_id": 3,
+      "change_type": "merged",
+      "segment_id": 2,
+      "revision": 1,
+      "merged_into": 1,
+      "segment": null
+    }
+  ],
+  "next_after": 3
+}
+```
+
+- **何时产生记录**：段创建、起止边界或最高级别变化（revision 递增）时产生 `upsert`（`segment` 为变更后的段快照）；多段合并时为**每个被删除段**产生一条 `merged` 墓碑（`merged_into` 指向保留段），随后是保留段的 `upsert`。仅事件数增加（revision 不变）或 `event_id` 幂等重放**不产生**任何记录。
+- **change_id**：在事件写入事务内生成，全库单调递增；记录只增不改。
+- **分页**：`after`（默认 0，返回 change_id 大于该值的记录）+ `limit`（默认 100，最大 1000）。用响应中的 `next_after` 作为下一页的 `after` 逐页拉取，直到返回空页（空页时 `next_after` 与入参 `after` 相同）。由于变更流只增不改，翻页期间的新写入只会追加到流末尾，**不会漏读也不会重复**。
+- **消费方式**：下游按 `change_id` 升序应用——`upsert` 覆盖本地段副本，`merged` 删除本地对应段（或记录到保留段的重定向），即可与上游保持一致。
+
 ### 健康检查 `GET /healthz`
 
 ## 归段与 revision 规则
@@ -73,6 +116,7 @@ curl 'http://localhost:8000/segments?source=edge-gateway-01'
 - 新事件的 `occurred_at` 落在某段 `[start - silence, end + silence]` 窗口内即并入该段；同时命中多个段（迟到事件桥接）时自动合并为一段，事件数累加。
 - 段的 `revision` 初始为 1；**仅当**新事件导致段的起止边界或最高级别发生变化时递增，仅事件数增加不递增。
 - `(source, event_id)` 唯一约束保证幂等：重复提交直接返回原段，不改计数、不改 revision。
+- 上述每次可见变化（含合并）都会在同一事务内追加到变更流 `segment_changes` 表，经 `GET /segment-changes` 供下游增量同步（见上文）。
 
 ## 本地开发与测试
 

@@ -30,6 +30,17 @@ CREATE TABLE IF NOT EXISTS events (
     UNIQUE (source, event_id)                -- 幂等去重键
 );
 CREATE INDEX IF NOT EXISTS idx_events_segment ON events (segment_id);
+
+-- 段变更流：供下游增量同步，只增不改
+CREATE TABLE IF NOT EXISTS segment_changes (
+    change_id   INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调递增的变更序号
+    segment_id  INTEGER NOT NULL,          -- upsert: 目标段；merged: 被删除段
+    change_type TEXT    NOT NULL CHECK (change_type IN ('upsert', 'merged')),
+    merged_into INTEGER,                   -- merged 时指向保留段 id，否则为 NULL
+    revision    INTEGER NOT NULL,          -- upsert: 段的新 revision；merged: 被删段最后的 revision
+    payload     TEXT,                      -- upsert: 变更后的段快照 JSON；merged: NULL
+    created_at  REAL    NOT NULL
+);
 """
 
 
